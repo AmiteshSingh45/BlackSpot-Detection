@@ -15,8 +15,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from app.database import get_db
-from app.models import Blackspot
-from app.schemas import BlackspotResponse, BlackspotListResponse, ClusterSummary
+from app.models import Blackspot, Segment, Recommendation
+from app.schemas import (
+    BlackspotResponse, BlackspotListResponse, BlackspotDetailResponse,
+    ClusterSummary, InlineRecommendation,
+)
 
 router = APIRouter(prefix="/blackspots", tags=["Blackspots"])
 
@@ -129,13 +132,18 @@ def get_cluster_summary(
 
 
 # ════════════════════════════════════════════════════════════════
-# GET /blackspots/{blackspot_id}  — Single blackspot
+# GET /blackspots/{blackspot_id}  — Single blackspot FULL DETAIL
 # ════════════════════════════════════════════════════════════════
 
 @router.get(
     "/{blackspot_id}",
-    response_model=BlackspotResponse,
-    summary="Get a single blackspot by ID",
+    response_model=BlackspotDetailResponse,
+    summary="Get full blackspot detail with explainability",
+    description=(
+        "Returns complete blackspot data including IRC criteria A–E flags, "
+        "adaptive thresholds used, confidence score, and inline recommendations. "
+        "Single round-trip — no separate explainability endpoint needed."
+    ),
 )
 def get_blackspot(blackspot_id: int, db: Session = Depends(get_db)):
     bs = db.get(Blackspot, blackspot_id)
@@ -144,4 +152,64 @@ def get_blackspot(blackspot_id: int, db: Session = Depends(get_db)):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Blackspot with id={blackspot_id} not found",
         )
-    return bs
+
+    # ── Fetch joined segment for criteria + threshold data ───────────────
+    seg: Segment | None = db.get(Segment, bs.segment_id) if bs.segment_id else None
+
+    # ── Fetch inline recommendations ─────────────────────────────
+    recs: list[Recommendation] = (
+        db.query(Recommendation)
+        .filter(Recommendation.blackspot_id == blackspot_id)
+        .order_by(Recommendation.priority.asc())
+        .all()
+    )
+    inline_recs = [
+        InlineRecommendation(
+            priority  = r.priority,
+            category  = r.category,
+            action    = r.action,
+            rationale = r.rationale,
+        )
+        for r in recs
+    ]
+
+    # ── Build response ────────────────────────────────────────
+    return BlackspotDetailResponse(
+        # — Core blackspot fields —
+        id                   = bs.id,
+        upload_id            = bs.upload_id,
+        segment_id           = bs.segment_id,
+        segment_500m         = bs.segment_500m,
+        rank                 = bs.rank,
+        total_accidents      = bs.total_accidents,
+        total_fatal          = bs.total_fatal,
+        total_grievous       = bs.total_grievous,
+        total_severity       = bs.total_severity,
+        accident_rate        = bs.accident_rate,
+        criteria_count       = bs.criteria_count,
+        risk_tier            = bs.risk_tier,
+        blackspot_rank_score = bs.blackspot_rank_score,
+        dominant_cause       = bs.dominant_cause,
+        dominant_nature      = bs.dominant_nature,
+        dominant_vehicle     = bs.dominant_vehicle,
+        dominant_time        = bs.dominant_time,
+        locations            = bs.locations,
+        cluster_id           = bs.cluster_id,
+        detected_at          = bs.detected_at,
+        confidence_score     = bs.confidence_score,
+        latitude             = bs.latitude,
+        longitude            = bs.longitude,
+        # — Criteria + thresholds from joined Segment —
+        criteria_a           = seg.criteria_a           if seg else False,
+        criteria_b           = seg.criteria_b           if seg else False,
+        criteria_c           = seg.criteria_c           if seg else False,
+        criteria_d           = seg.criteria_d           if seg else False,
+        criteria_e           = seg.criteria_e           if seg else False,
+        accident_threshold   = seg.accident_threshold   if seg else None,
+        severity_threshold   = seg.severity_threshold   if seg else None,
+        fatal_threshold      = seg.fatal_threshold      if seg else None,
+        grievous_threshold   = seg.grievous_threshold   if seg else None,
+        rate_threshold       = seg.rate_threshold       if seg else None,
+        # — Inline recommendations —
+        recommendations      = inline_recs,
+    )

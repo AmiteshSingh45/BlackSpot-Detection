@@ -17,10 +17,11 @@ from pathlib import Path
 
 from fastapi import (
     APIRouter, Depends, File, HTTPException,
-    UploadFile, BackgroundTasks, status
+    UploadFile, BackgroundTasks, status, Body
 )
 from sqlalchemy.orm import Session
 from loguru import logger
+from pydantic import BaseModel
 
 from app.database import get_db
 from app.models import Upload
@@ -228,3 +229,93 @@ def rerun_pipeline(
         upload_id = upload_id,
         status    = "processing",
     )
+
+
+# ════════════════════════════════════════════════════════════════
+# DELETE /uploads/{upload_id}  — Delete upload & cascaded data
+# ════════════════════════════════════════════════════════════════
+
+@router.delete(
+    "/{upload_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete an upload and all associated records",
+    description="Completely purges an upload alongside any connected pipeline analytical records."
+)
+def delete_upload(upload_id: int, db: Session = Depends(get_db)):
+    upload = db.get(Upload, upload_id)
+    if not upload:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Upload with id={upload_id} not found",
+        )
+
+    # Clean local file
+    file_path = Path(settings.UPLOAD_DIR) / upload.filename
+    if file_path.exists() and file_path.is_file():
+        try:
+            file_path.unlink()
+            logger.info(f"Deleted physical file: {file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to delete physical file {file_path}: {e}")
+
+    # Manual cascade deletion to guarantee referential cleanup of aggregated data
+    try:
+        from app.models import Accident, Segment, Blackspot, Alert, Recommendation
+        
+        # Keep track of counts for logging
+        r_deleted = db.query(Recommendation).filter(Recommendation.upload_id == upload_id).delete(synchronize_session=False)
+        a_deleted = db.query(Alert).filter(Alert.upload_id == upload_id).delete(synchronize_session=False)
+        b_deleted = db.query(Blackspot).filter(Blackspot.upload_id == upload_id).delete(synchronize_session=False)
+        s_deleted = db.query(Segment).filter(Segment.upload_id == upload_id).delete(synchronize_session=False)
+        acc_deleted = db.query(Accident).filter(Accident.upload_id == upload_id).delete(synchronize_session=False)
+        
+        db.delete(upload)
+        db.commit()
+        logger.info(f"Successfully purged Upload id={upload_id}. Deleted: {acc_deleted} accidents, {s_deleted} segments, {b_deleted} blackspots, {a_deleted} alerts, {r_deleted} recommendations.")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed deleting Upload id={upload_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to thoroughly purge database records."
+        )
+
+
+# ════════════════════════════════════════════════════════════════
+# PATCH /uploads/{upload_id}/label  — Tag an upload with metadata
+# ════════════════════════════════════════════════════════════════
+
+class UploadLabelBody(BaseModel):
+    upload_label:  str  | None = None   # e.g. "NH-48 · 2022 Annual Data"
+    upload_year:   int  | None = None   # e.g. 2022
+    upload_source: str  | None = None   # e.g. "NHAI"
+
+
+@router.patch(
+    "/{upload_id}/label",
+    response_model=UploadResponse,
+    summary="Set metadata label on an upload",
+    description=(
+        "Allows users to tag an upload with a human-readable label, "
+        "summary year, and data source. Used in the comparison UI and PDF reports."
+    ),
+)
+def label_upload(
+    upload_id: int,
+    body: UploadLabelBody,
+    db: Session = Depends(get_db),
+):
+    upload = db.get(Upload, upload_id)
+    if not upload:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Upload with id={upload_id} not found",
+        )
+    if body.upload_label  is not None: upload.upload_label  = body.upload_label
+    if body.upload_year   is not None: upload.upload_year   = body.upload_year
+    if body.upload_source is not None: upload.upload_source = body.upload_source
+    db.commit()
+    db.refresh(upload)
+    logger.info(f"Upload {upload_id} labelled: '{upload.upload_label}'")
+    return upload
+

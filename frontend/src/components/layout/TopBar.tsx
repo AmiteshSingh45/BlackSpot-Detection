@@ -2,6 +2,7 @@
 import { Bell, Search, Sun, Moon, User } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { useTheme } from "@/context/ThemeContext";
+import FreshnessBadge from "@/components/ui/FreshnessBadge";
 
 const pageTitles: Record<string, { title: string; subtitle: string; emoji: string }> = {
   "/":           { title: "Dashboard",   subtitle: "Real-time road safety overview",          emoji: "📊" },
@@ -76,6 +77,19 @@ export default function TopBar() {
       {/* Right: actions */}
       <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
 
+        {/* Data Freshness Indicator */}
+        <div style={{
+          padding:      "6px 12px",
+          borderRadius: "8px",
+          background:   "var(--bg-card)",
+          border:       "1px solid var(--border)",
+          display:      "flex",
+          alignItems:   "center",
+        }}>
+          <FreshnessBadge />
+        </div>
+
+
         {/* Search bar */}
         <div
           style={{
@@ -121,6 +135,7 @@ export default function TopBar() {
 
         {/* Theme toggle */}
         <button
+          suppressHydrationWarning
           id="theme-toggle"
           onClick={toggleTheme}
           title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
@@ -159,6 +174,7 @@ export default function TopBar() {
 
         {/* Notification */}
         <button
+          suppressHydrationWarning
           className="btn-icon btn"
           title="Notifications"
           style={{ position: "relative", color: "var(--text-secondary)" }}

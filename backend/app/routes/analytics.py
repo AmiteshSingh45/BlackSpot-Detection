@@ -25,7 +25,8 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Accident, Blackspot, Segment, Upload
 from app.schemas import (
-    DashboardStats, YearlyTrend, CategoryCount, MonthlyTrend
+    DashboardStats, YearlyTrend, CategoryCount, MonthlyTrend,
+    InsightItem, PersistentBlackspot, DataFreshness,
 )
 
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
@@ -410,3 +411,269 @@ def get_top_blackspots(
         for bs in blackspots
     ]
     return {"top_blackspots": result, "count": len(result)}
+
+
+# ════════════════════════════════════════════════════════════════
+# GET /analytics/insights  — Auto-generated plain-language insight strings
+# ════════════════════════════════════════════════════════════════
+
+@router.get(
+    "/insights",
+    response_model=list[InsightItem],
+    summary="Auto-generated decision insights",
+    description=(
+        "Returns plain-language observations derived from the analytics data. "
+        "Covers YoY accident trends, fatality share, night-time risk, and top blackspot summary."
+    ),
+)
+def get_insights(
+    upload_id: Optional[int] = Query(None, description="Filter to a specific upload"),
+    db: Session = Depends(get_db),
+):
+    insights: list[InsightItem] = []
+
+    # ─ Yearly trend for YoY change ────────────────────────────────
+    acc_q = db.query(Accident.year, func.count(Accident.id).label("cnt"))
+    if upload_id:
+        acc_q = acc_q.filter(Accident.upload_id == upload_id)
+    yearly = (
+        acc_q.filter(Accident.year.isnot(None))
+        .group_by(Accident.year)
+        .order_by(Accident.year)
+        .all()
+    )
+
+    if len(yearly) >= 2:
+        y0_cnt = yearly[-2].cnt
+        y1_cnt = yearly[-1].cnt
+        y0_yr  = yearly[-2].year
+        y1_yr  = yearly[-1].year
+        if y0_cnt > 0:
+            pct = round((y1_cnt - y0_cnt) / y0_cnt * 100, 1)
+            trend = "down" if pct < 0 else ("up" if pct > 0 else "neutral")
+            arrow = "↓" if trend == "down" else ("↑" if trend == "up" else "→")
+            insights.append(InsightItem(
+                metric     = "accidents",
+                text       = f"Accidents {arrow} {abs(pct)}% from {y0_yr} to {y1_yr} ({y0_cnt} → {y1_cnt})",
+                trend      = trend,
+                value      = float(y1_cnt),
+                pct_change = pct,
+            ))
+
+    # ─ Fatality share ─────────────────────────────────────────
+    fat_q = db.query(
+        func.sum(Accident.fatal).label("total_fatal"),
+        func.count(Accident.id).label("total_acc"),
+    )
+    if upload_id:
+        fat_q = fat_q.filter(Accident.upload_id == upload_id)
+    fat_row = fat_q.one_or_none()
+    if fat_row and fat_row.total_acc and fat_row.total_acc > 0:
+        fat_pct = round((fat_row.total_fatal or 0) / fat_row.total_acc * 100, 1)
+        insights.append(InsightItem(
+            metric = "fatalities",
+            text   = f"Fatalities account for {fat_pct}% of all accidents ({fat_row.total_fatal} deaths)",
+            trend  = "neutral",
+            value  = float(fat_row.total_fatal or 0),
+        ))
+
+    # ─ Night-time share ─────────────────────────────────────
+    night_q = db.query(func.count(Accident.id).label("cnt"))
+    if upload_id:
+        night_q = night_q.filter(Accident.upload_id == upload_id)
+    night_cnt = night_q.filter(
+        Accident.time_of_day.in_(["Night", "Early Morning"])
+    ).scalar() or 0
+    total_cnt = (
+        db.query(func.count(Accident.id))
+        .filter(Accident.upload_id == upload_id if upload_id else True)
+        .scalar() or 0
+    )
+    if total_cnt > 0:
+        night_pct = round(night_cnt / total_cnt * 100, 1)
+        insights.append(InsightItem(
+            metric = "night_risk",
+            text   = f"Night-time / early morning incidents: {night_pct}% of all accidents",
+            trend  = "up" if night_pct > 30 else "neutral",
+            value  = float(night_cnt),
+        ))
+
+    # ─ Top blackspot summary ────────────────────────────────
+    bs_q = db.query(Blackspot).order_by(Blackspot.blackspot_rank_score.desc())
+    if upload_id:
+        bs_q = bs_q.filter(Blackspot.upload_id == upload_id)
+    top_bs = bs_q.first()
+    if top_bs:
+        conf_label = (
+            "Confirmed" if (top_bs.confidence_score or 0) >= 75
+            else "Likely" if (top_bs.confidence_score or 0) >= 50
+            else "Possible"
+        )
+        insights.append(InsightItem(
+            metric = "top_blackspot",
+            text   = (
+                f"Most dangerous location: km {top_bs.segment_500m} — "
+                f"{top_bs.risk_tier}, {top_bs.total_accidents} accidents, "
+                f"{top_bs.total_fatal} fatal ({conf_label} confidence)"
+            ),
+            trend  = "up",
+            value  = float(top_bs.blackspot_rank_score),
+        ))
+
+    # ─ Worst month ─────────────────────────────────────────
+    month_q = db.query(
+        Accident.month,
+        func.count(Accident.id).label("cnt"),
+    )
+    if upload_id:
+        month_q = month_q.filter(Accident.upload_id == upload_id)
+    worst_month = (
+        month_q.filter(Accident.month.isnot(None))
+        .group_by(Accident.month)
+        .order_by(func.count(Accident.id).desc())
+        .first()
+    )
+    if worst_month:
+        month_names = ["","Jan","Feb","Mar","Apr","May","Jun",
+                       "Jul","Aug","Sep","Oct","Nov","Dec"]
+        mname = month_names[worst_month.month] if 1 <= worst_month.month <= 12 else str(worst_month.month)
+        insights.append(InsightItem(
+            metric = "worst_month",
+            text   = f"Peak accident month: {mname} ({worst_month.cnt} incidents)",
+            trend  = "up",
+            value  = float(worst_month.cnt),
+        ))
+
+    return insights
+
+
+# ════════════════════════════════════════════════════════════════
+# GET /analytics/persistent-blackspots
+# Returns locations that appear in 2+ uploads with tier >= HIGH
+# ════════════════════════════════════════════════════════════════
+
+_TIER_PRIORITY = {"CRITICAL": 5, "HIGH": 4, "MODERATE": 3, "BLACK SPOT": 2, "WATCH ZONE": 1, "SAFE": 0}
+_HIGH_TIER_SET = {"CRITICAL", "HIGH", "BLACK SPOT"}
+
+@router.get(
+    "/persistent-blackspots",
+    response_model=list[PersistentBlackspot],
+    summary="Persistent / chronic high-risk blackspots",
+    description=(
+        "Returns blackspot locations that appear in 2+ uploads AND have at least one "
+        "occurrence with risk tier ≥ HIGH. Sorted by upload_count descending. "
+        "is_chronic = True when upload_count ≥ 3."
+    ),
+)
+def get_persistent_blackspots(db: Session = Depends(get_db)):
+    # Fetch all blackspots, group by km (within ±0.25 km tolerance)
+    all_bs: list[Blackspot] = (
+        db.query(Blackspot)
+        .order_by(Blackspot.segment_500m)
+        .all()
+    )
+
+    # Cluster by km with tolerance
+    groups: dict[float, list[Blackspot]] = {}
+    for bs in all_bs:
+        km = bs.segment_500m
+        found = None
+        for rep_km in groups:
+            if abs(rep_km - km) <= 0.25:
+                found = rep_km
+                break
+        if found is not None:
+            groups[found].append(bs)
+        else:
+            groups[km] = [bs]
+
+    # Fetch upload label map
+    uploads = db.query(Upload.id, Upload.upload_label, Upload.original_filename).all()
+    upload_label_map = {
+        u.id: (u.upload_label or u.original_filename or f"Upload #{u.id}")
+        for u in uploads
+    }
+
+    result: list[PersistentBlackspot] = []
+    for rep_km, members in groups.items():
+        # Count unique uploads
+        unique_upload_ids = list({bs.upload_id for bs in members})
+        if len(unique_upload_ids) < 2:
+            continue
+        # Must have at least one HIGH+ tier occurrence
+        tiers = [(bs.risk_tier or "SAFE").upper() for bs in members]
+        max_tier = max(tiers, key=lambda t: _TIER_PRIORITY.get(t, 0))
+        if max_tier not in _HIGH_TIER_SET:
+            continue
+
+        avg_acc = round(sum(bs.total_accidents for bs in members) / len(members), 1)
+
+        result.append(PersistentBlackspot(
+            segment_500m  = rep_km,
+            upload_count  = len(unique_upload_ids),
+            upload_ids    = unique_upload_ids,
+            upload_labels = [upload_label_map.get(uid) for uid in unique_upload_ids],
+            risk_tiers    = tiers,
+            max_risk_tier = max_tier,
+            avg_accidents = avg_acc,
+            is_chronic    = len(unique_upload_ids) >= 3,
+        ))
+
+    result.sort(key=lambda x: x.upload_count, reverse=True)
+    return result
+
+
+# ════════════════════════════════════════════════════════════════
+# GET /analytics/freshness  — Data freshness timestamp for TopBar badge
+# ════════════════════════════════════════════════════════════════
+
+@router.get(
+    "/freshness",
+    response_model=DataFreshness,
+    summary="Data freshness metadata",
+    description="Returns the timestamp of the latest upload and pipeline completion, used for the UI freshness badge.",
+)
+def get_freshness(db: Session = Depends(get_db)):
+    latest_upload = (
+        db.query(Upload)
+        .order_by(Upload.uploaded_at.desc())
+        .first()
+    )
+    latest_completed = (
+        db.query(Upload)
+        .filter(Upload.status == "completed", Upload.pipeline_ended.isnot(None))
+        .order_by(Upload.pipeline_ended.desc())
+        .first()
+    )
+    total_uploads  = db.query(func.count(Upload.id)).scalar() or 0
+    total_bs       = db.query(func.count(Blackspot.id)).scalar() or 0
+
+    return DataFreshness(
+        last_upload_at      = latest_upload.uploaded_at    if latest_upload    else None,
+        last_completed_at   = latest_completed.pipeline_ended if latest_completed else None,
+        latest_upload_label = (
+            latest_completed.upload_label or latest_completed.original_filename
+            if latest_completed else None
+        ),
+        total_uploads       = total_uploads,
+        total_blackspots    = total_bs,
+    )
+
+
+# ════════════════════════════════════════════════════════════════
+# GET /analytics/export/pdf  — Server-side PDF (v2 stub)
+# ════════════════════════════════════════════════════════════════
+
+@router.get(
+    "/export/pdf",
+    summary="Server-side PDF export (v2 placeholder)",
+    description="Future: server-side reportlab PDF generation for large datasets. Currently returns a placeholder.",
+)
+def export_pdf_stub():
+    return {
+        "status": "not_implemented",
+        "message": (
+            "Server-side PDF generation is a v2 feature for datasets >5000 records. "
+            "Use the client-side PDF export (POST from Reports page) for current use."
+        ),
+    }

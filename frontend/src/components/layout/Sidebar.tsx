@@ -3,19 +3,23 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   LayoutDashboard, Map, Upload, AlertTriangle, BarChart2,
-  Shield, Activity, Zap,
+  Shield, Activity, Zap, Bell, FileText,
 } from "lucide-react";
+import { useAlertContext } from "@/context/AlertContext";
 
 const navItems = [
   { label: "Dashboard",  href: "/",          icon: LayoutDashboard, accent: "#4f8ef7" },
   { label: "Map",        href: "/map",        icon: Map,             accent: "#06b6d4" },
   { label: "Blackspots", href: "/blackspots", icon: AlertTriangle,   accent: "#ef4444" },
   { label: "Analytics",  href: "/analytics",  icon: BarChart2,       accent: "#8b5cf6" },
+  { label: "Alerts",     href: "/alerts",     icon: Bell,            accent: "#f59e0b" },
+  { label: "Reports",    href: "/reports",    icon: FileText,        accent: "#10b981" },
   { label: "Upload",     href: "/upload",     icon: Upload,          accent: "#10b981" },
 ];
 
 export default function Sidebar() {
   const path = usePathname();
+  const { unreadCount } = useAlertContext();
 
   return (
     <aside
@@ -149,6 +153,29 @@ export default function Sidebar() {
                 />
               </div>
               {label}
+
+              {/* Alert badge */}
+              {label === "Alerts" && unreadCount > 0 && (
+                <span
+                  style={{
+                    marginLeft: "auto",
+                    minWidth: 18,
+                    height: 18,
+                    borderRadius: "9px",
+                    background: "#ef4444",
+                    color: "#fff",
+                    fontSize: "10px",
+                    fontWeight: 700,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    padding: "0 5px",
+                    flexShrink: 0,
+                  }}
+                >
+                  {unreadCount > 99 ? "99+" : unreadCount}
+                </span>
+              )}
 
               {/* Active indicator dot */}
               {active && (

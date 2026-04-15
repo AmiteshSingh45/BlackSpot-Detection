@@ -39,6 +39,11 @@ class Upload(Base):
     segment_count    = Column(Integer, nullable=True)
     error_message    = Column(Text, nullable=True)
 
+    # ── User-supplied metadata for comparison / labelling ─────────
+    upload_label     = Column(String(200), nullable=True)  # e.g. "NH-48 · 2022 Annual Data"
+    upload_year      = Column(Integer,     nullable=True)  # summary year of the dataset
+    upload_source    = Column(String(100), nullable=True)  # e.g. "NHAI", "State PWD"
+
     # ── Relationships ────────────────────────────────────────────
     accidents  = relationship("Accident",  back_populates="upload",
                                cascade="all, delete-orphan")
@@ -196,13 +201,97 @@ class Blackspot(Base):
     dominant_vehicle    = Column(String(150), nullable=True)
     dominant_time       = Column(String(20),  nullable=True)
     locations           = Column(Text,    nullable=True)
-    cluster_id          = Column(Integer, nullable=True)
+    cluster_id          = Column(Integer, nullable=True)  # -1 = noise
     detected_at         = Column(DateTime(timezone=True), server_default=func.now())
 
-    # ── Relationships ────────────────────────────────────────────
-    upload  = relationship("Upload",  back_populates="blackspots")
-    segment = relationship("Segment", back_populates="blackspot")
+    # ── Resolved GPS coordinates (OSM interpolation) ───────────────────
+    latitude            = Column(Float, nullable=True)
+    longitude           = Column(Float, nullable=True)
+
+    # ── ML confidence score (0–100) ──────────────────────────────────
+    # Formula: criteria(50%) + cluster_bonus(20%) + consistency_bonus(30%)
+    confidence_score    = Column(Float, nullable=True)
+
+    # ── Relationships ───────────────────────────────────────────────
+    upload          = relationship("Upload",  back_populates="blackspots")
+    segment         = relationship("Segment", back_populates="blackspot")
+    alerts          = relationship("Alert",          back_populates="blackspot",
+                                   cascade="all, delete-orphan")
+    recommendations = relationship("Recommendation", back_populates="blackspot",
+                                   cascade="all, delete-orphan")
 
     def __repr__(self):
         return (f"<Blackspot km={self.segment_500m} "
                 f"rank={self.rank} tier={self.risk_tier}>")
+
+
+# ════════════════════════════════════════════════════════════════
+# 5. ALERTS — auto-generated notifications from the pipeline
+# ════════════════════════════════════════════════════════════════
+class Alert(Base):
+    __tablename__ = "alerts"
+
+    id               = Column(Integer, primary_key=True, index=True)
+    blackspot_id     = Column(Integer, ForeignKey("blackspots.id",
+                               ondelete="CASCADE"), nullable=False, index=True)
+    upload_id        = Column(Integer, ForeignKey("uploads.id",
+                               ondelete="CASCADE"), nullable=False, index=True)
+
+    # ── Location snapshot ────────────────────────────────────────────
+    segment_500m     = Column(Float, nullable=False)
+    latitude         = Column(Float, nullable=True)
+    longitude        = Column(Float, nullable=True)
+
+    # ── Risk snapshot ──────────────────────────────────────────────
+    risk_tier        = Column(String(30), nullable=False)
+    risk_score       = Column(Float, nullable=False)
+
+    # ── Alert metadata ────────────────────────────────────────────
+    # Values: HIGH_RISK | WEATHER_COMPOUND | NEW_BLACKSPOT
+    alert_type       = Column(String(50), nullable=False, default="HIGH_RISK")
+    message          = Column(Text, nullable=False)
+    weather_condition = Column(String(100), nullable=True)
+
+    # ── Priority score (0–100) ───────────────────────────────────
+    # tier(40%) + confidence(35%) + fatalities(25%)
+    priority_score   = Column(Float, nullable=True)
+
+    # ── State ────────────────────────────────────────────────────
+    acknowledged     = Column(Boolean, default=False, nullable=False)
+    acknowledged_at  = Column(DateTime(timezone=True), nullable=True)
+    triggered_at     = Column(DateTime(timezone=True), server_default=func.now())
+
+    # ── Relationships ───────────────────────────────────────────────
+    blackspot = relationship("Blackspot", back_populates="alerts")
+
+    def __repr__(self):
+        return (f"<Alert id={self.id} km={self.segment_500m} "
+                f"tier={self.risk_tier} ack={self.acknowledged}>")
+
+
+# ════════════════════════════════════════════════════════════════
+# 6. RECOMMENDATIONS — rule-based action suggestions per blackspot
+# ════════════════════════════════════════════════════════════════
+class Recommendation(Base):
+    __tablename__ = "recommendations"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    blackspot_id   = Column(Integer, ForeignKey("blackspots.id",
+                             ondelete="CASCADE"), nullable=False, index=True)
+    upload_id      = Column(Integer, ForeignKey("uploads.id",
+                             ondelete="CASCADE"), nullable=False, index=True)
+
+    # Values: HIGH | MEDIUM | LOW
+    priority       = Column(String(10),  nullable=False)
+    # Values: Infrastructure | Enforcement | Lighting | Signage | Emergency
+    category       = Column(String(50),  nullable=False)
+    action         = Column(Text,        nullable=False)
+    rationale      = Column(Text,        nullable=False)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+
+    # ── Relationships ───────────────────────────────────────────────
+    blackspot = relationship("Blackspot", back_populates="recommendations")
+
+    def __repr__(self):
+        return (f"<Recommendation id={self.id} priority={self.priority} "
+                f"category={self.category}>")

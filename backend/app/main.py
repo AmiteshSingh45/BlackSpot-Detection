@@ -19,7 +19,7 @@ from loguru import logger
 
 from app.config import settings
 from app.database import Base, engine
-from app.routes import upload, blackspots, segments, analytics
+from app.routes import upload, blackspots, segments, analytics, predict, alerts, recommendations, weather
 
 
 # ════════════════════════════════════════════════════════════════
@@ -122,10 +122,14 @@ app.add_middleware(
 
 API_PREFIX = f"/api/{settings.API_VERSION}"
 
-app.include_router(upload.router,     prefix=API_PREFIX)
-app.include_router(blackspots.router, prefix=API_PREFIX)
-app.include_router(segments.router,   prefix=API_PREFIX)
-app.include_router(analytics.router,  prefix=API_PREFIX)
+app.include_router(upload.router,           prefix=API_PREFIX)
+app.include_router(blackspots.router,       prefix=API_PREFIX)
+app.include_router(segments.router,         prefix=API_PREFIX)
+app.include_router(analytics.router,        prefix=API_PREFIX)
+app.include_router(predict.router,          prefix=API_PREFIX)
+app.include_router(alerts.router,           prefix=API_PREFIX)
+app.include_router(recommendations.router,  prefix=API_PREFIX)
+app.include_router(weather.router,          prefix=API_PREFIX)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -140,10 +144,14 @@ def root():
         "status":   "running",
         "docs":     "/docs",
         "endpoints": {
-            "upload":     f"{API_PREFIX}/uploads",
-            "blackspots": f"{API_PREFIX}/blackspots",
-            "segments":   f"{API_PREFIX}/segments",
-            "analytics":  f"{API_PREFIX}/analytics/stats",
+            "upload":          f"{API_PREFIX}/uploads",
+            "blackspots":      f"{API_PREFIX}/blackspots",
+            "segments":        f"{API_PREFIX}/segments",
+            "analytics":       f"{API_PREFIX}/analytics/stats",
+            "predict":         f"{API_PREFIX}/predict",
+            "alerts":          f"{API_PREFIX}/alerts",
+            "recommendations": f"{API_PREFIX}/recommendations",
+            "weather":         f"{API_PREFIX}/weather/current",
         },
     }
 
@@ -168,3 +176,5 @@ def health_check():
         "database":  db_status,
         "api":       settings.API_VERSION,
     }
+
+# Server forced reload triggger

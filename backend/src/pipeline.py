@@ -222,6 +222,7 @@ def _persist_blackspots(blackspots_df: pd.DataFrame,
             dominant_time       = _safe_str(row.get("dominant_time")),
             locations           = _safe_str(row.get("locations")),
             cluster_id          = _safe_int(row.get("cluster_id")),
+            confidence_score    = _safe_float(row.get("confidence_score")),
         )
         bs_objs.append(obj)
 
@@ -287,9 +288,20 @@ def run_pipeline(file_path: str, upload_id: int, db: Session) -> dict:
         logger.info("▶ Stage 3: Segmentation...")
         segment_df = aggregate_segments(df)
 
-        # ── STAGE 4: Blackspot Detection ─────────────────────────
+        # ── STAGE 4: Blackspot Detection ─────────────────────────────
         logger.info("▶ Stage 4: Blackspot Detection...")
-        segment_df = detect_blackspots(segment_df)
+
+        # Fetch prior blackspot km values from OTHER uploads for consistency scoring
+        prior_blackspot_kms: set[float] = set(
+            km for (km,) in
+            db.query(Blackspot.segment_500m)
+            .filter(Blackspot.upload_id != upload_id)
+            .distinct()
+            .all()
+        )
+        logger.info(f"Prior blackspot reference KMs loaded: {len(prior_blackspot_kms)}")
+
+        segment_df = detect_blackspots(segment_df, prior_blackspot_kms=prior_blackspot_kms)
         blackspots_df = get_blackspots_df(segment_df)
 
         n_segments   = len(segment_df)
@@ -317,6 +329,23 @@ def run_pipeline(file_path: str, upload_id: int, db: Session) -> dict:
         upload.blackspot_count = n_blackspots
         upload.segment_count   = n_segments
         db.commit()
+
+        # ── POST-PIPELINE: Alerts + Recommendations ─────────────────────────
+        # These run after the core pipeline is committed. Wrapped in
+        # try/except so failures here never corrupt the main data.
+        try:
+            from app.services.alert_service import generate_alerts
+            alerts_generated = generate_alerts(db, upload_id)
+            logger.info(f"Post-pipeline: {len(alerts_generated)} alerts generated")
+        except Exception as ae:
+            logger.error(f"Alert generation failed (non-fatal): {ae}")
+
+        try:
+            from app.services.recommendation_service import generate_recommendations
+            rec_count = generate_recommendations(db, upload_id)
+            logger.info(f"Post-pipeline: {rec_count} recommendations generated")
+        except Exception as re:
+            logger.error(f"Recommendation generation failed (non-fatal): {re}")
 
         summary = {
             "upload_id":       upload_id,

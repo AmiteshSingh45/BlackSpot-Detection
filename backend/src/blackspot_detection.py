@@ -22,6 +22,13 @@ from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import MinMaxScaler
 from app.config import settings
 
+CRITERIA_WEIGHTS = {
+    "criteria_a": 1,  # accident frequency
+    "criteria_b": 3,  # fatal count (highest signal)
+    "criteria_c": 1,  # severity score
+    "criteria_d": 2,  # grievous injuries
+    "criteria_e": 1,  # accident rate
+}
 
 # ════════════════════════════════════════════════════════════════
 # STEP 1 — ADAPTIVE THRESHOLDS (Data-Driven Percentiles)
@@ -42,10 +49,10 @@ def compute_adaptive_thresholds(segment_df: pd.DataFrame) -> dict:
     rate_pct = settings.RATE_PERCENTILE
 
     thresholds = {
-        "accident":  max(3, segment_df["total_accidents"].quantile(acc_pct / 100)),
-        "severity":  max(5, segment_df["total_severity"].quantile(sev_pct  / 100)),
+        "accident":  max(5, segment_df["total_accidents"].quantile(acc_pct / 100)),
+        "severity":  max(8, segment_df["total_severity"].quantile(sev_pct  / 100)),
         "fatal":     max(1, segment_df["total_fatal"].quantile(fat_pct  / 100)),
-        "grievous":  max(2, segment_df["total_grievous"].quantile(grv_pct  / 100)),
+        "grievous":  max(3, segment_df["total_grievous"].quantile(grv_pct  / 100)),
         "rate":      segment_df["accident_rate"].quantile(rate_pct / 100),
     }
 
@@ -96,9 +103,22 @@ def apply_irc_criteria(segment_df: pd.DataFrame,
         df["criteria_e"].astype(int)
     )
 
-    min_criteria = settings.BLACKSPOT_MIN_CRITERIA
-    df["is_blackspot"]  = df["criteria_count"] >= min_criteria
-    df["is_watch_zone"] = df["criteria_count"] == 1
+    df["criteria_weighted_score"] = (
+        df["criteria_a"].astype(int) * CRITERIA_WEIGHTS["criteria_a"] +
+        df["criteria_b"].astype(int) * CRITERIA_WEIGHTS["criteria_b"] +
+        df["criteria_c"].astype(int) * CRITERIA_WEIGHTS["criteria_c"] +
+        df["criteria_d"].astype(int) * CRITERIA_WEIGHTS["criteria_d"] +
+        df["criteria_e"].astype(int) * CRITERIA_WEIGHTS["criteria_e"]
+    )
+
+    min_criteria = getattr(settings, "BLACKSPOT_MIN_CRITERIA", 3)
+    min_weighted = getattr(settings, "BLACKSPOT_MIN_WEIGHTED_SCORE", 4)
+    
+    df["passes_criteria_gate"] = (df["criteria_count"] >= min_criteria) & (df["criteria_weighted_score"] >= min_weighted)
+    df["is_blackspot"] = False
+    
+    # Watch zone includes single criteria OR passes count but fails weighted gate
+    df["is_watch_zone"] = (df["criteria_count"] == 1) | ((df["criteria_count"] >= min_criteria) & ~df["passes_criteria_gate"])
 
     # Store the threshold values in each row for audit trail
     df["accident_threshold"] = thresholds["accident"]
@@ -116,16 +136,29 @@ def apply_irc_criteria(segment_df: pd.DataFrame,
 
 def assign_risk_tier(row: pd.Series) -> str:
     """
-    Assign human-readable risk tier based on criteria_count.
-    Mirrors notebook risk_tier() function exactly.
+    Assign human-readable risk tier based on criteria_weighted_score.
     """
+    w = row["criteria_weighted_score"]
     c = row["criteria_count"]
-    if c >= 5: return "CRITICAL"
-    if c >= 4: return "HIGH"
-    if c >= 3: return "MODERATE"
-    if c >= 2: return "BLACK SPOT"
-    if c == 1: return "WATCH ZONE"
-    return "SAFE"
+    b = row["criteria_b"]
+
+    if w >= 7:
+        tier_idx = 4  # CRITICAL
+    elif w >= 5:
+        tier_idx = 3  # HIGH
+    elif w >= 4:
+        tier_idx = 2  # MODERATE
+    elif w >= 2:
+        tier_idx = 1  # WATCH ZONE
+    else:
+        tier_idx = 0  # SAFE
+
+    # Fatal bonus: boost one tier if criteria B is true and count >= 2
+    if b and c >= 2:
+        tier_idx = min(4, tier_idx + 1)
+
+    tiers = ["SAFE", "WATCH ZONE", "MODERATE", "HIGH", "CRITICAL"]
+    return tiers[tier_idx]
 
 
 # ════════════════════════════════════════════════════════════════
@@ -222,12 +255,81 @@ def compute_normalized_risk_score(segment_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ════════════════════════════════════════════════════════════════
+# STEP 6 — ML: CONFIDENCE SCORE (0–100, bias-free formula)
+# ════════════════════════════════════════════════════════════════
+
+def compute_confidence_score(
+    segment_df: pd.DataFrame,
+    prior_blackspot_kms: set | None = None,
+) -> pd.DataFrame:
+    """
+    Compute a 0–100 confidence score for each detected blackspot.
+
+    Formula uses three INDEPENDENT signals (no correlation bias):
+
+      confidence =
+          (criteria_count / 5) × 50    → 0–50 pts  — pure rule satisfaction
+        + cluster_bonus         × 20    → 0–20 pts  — DBSCAN spatial cluster membership
+        + consistency_bonus     × 30    → 0–30 pts  — cross-upload persistence
+
+    Where:
+      cluster_bonus     = 1.0 if cluster_id >= 0 else 0.0
+      consistency_bonus = min(prior_count, 3) / 3   (capped at 1.0)
+
+    Labels:
+      >= 75 → "Confirmed"
+      >= 50 → "Likely"
+      <  50 → "Possible"
+
+    Args:
+        segment_df:         Full segment DataFrame (post-DBSCAN).
+        prior_blackspot_kms: Set of segment_500m values from prior uploads.
+                             Pass None or empty set for first-ever upload.
+    Returns:
+        segment_df with 'confidence_score' column added.
+    """
+    if prior_blackspot_kms is None:
+        prior_blackspot_kms = set()
+
+    bs_mask = segment_df["is_blackspot"]
+    segment_df["confidence_score"] = np.nan
+
+    if not bs_mask.any():
+        return segment_df
+
+    def _score(row) -> float:
+        criteria_pts     = (row["criteria_count"] / 5) * 50
+        cluster_pts      = 20.0 if (row.get("cluster_id", -1) or -1) >= 0 else 0.0
+        # consistency: how many prior uploads had a blackspot at this km (±0.3 km)
+        km = row["segment_500m"]
+        matching_prior = sum(
+            1 for p in prior_blackspot_kms if abs(p - km) <= 0.3
+        )
+        consistency_ratio = min(matching_prior, 3) / 3
+        consistency_pts   = consistency_ratio * 30
+        return round(criteria_pts + cluster_pts + consistency_pts, 1)
+
+    segment_df.loc[bs_mask, "confidence_score"] = (
+        segment_df[bs_mask].apply(_score, axis=1)
+    )
+
+    logger.info(
+        "Confidence scores — "
+        f"mean={segment_df.loc[bs_mask, 'confidence_score'].mean():.1f} | "
+        f"min={segment_df.loc[bs_mask, 'confidence_score'].min():.1f} | "
+        f"max={segment_df.loc[bs_mask, 'confidence_score'].max():.1f}"
+    )
+    return segment_df
+
+
+# ════════════════════════════════════════════════════════════════
 # MASTER FUNCTION — detect_blackspots()
 # ════════════════════════════════════════════════════════════════
 
 def detect_blackspots(segment_df: pd.DataFrame,
                        dbscan_eps: float = 1.0,
-                       min_samples: int = 2) -> pd.DataFrame:
+                       min_samples: int = 2,
+                       prior_blackspot_kms: set | None = None) -> pd.DataFrame:
     """
     Full Stage 3 (Revised) blackspot detection pipeline.
 
@@ -242,9 +344,11 @@ def detect_blackspots(segment_df: pd.DataFrame,
       8. Log summary
 
     Args:
-        segment_df:  Output of segmentation.aggregate_segments()
-        dbscan_eps:  DBSCAN epsilon in km (default 1.0 = 1km)
-        min_samples: DBSCAN min_samples (default 2)
+        segment_df:         Output of segmentation.aggregate_segments()
+        dbscan_eps:         DBSCAN epsilon in km (default 1.0 = 1km)
+        min_samples:        DBSCAN min_samples (default 2)
+        prior_blackspot_kms: Set of segment_500m values from prior uploads
+                             used to compute the consistency bonus in confidence scoring.
 
     Returns:
         Full segment_df with all detection columns added.
@@ -274,13 +378,31 @@ def detect_blackspots(segment_df: pd.DataFrame,
     # Step 4 — Rank score
     segment_df = compute_rank_score(segment_df)
 
-    # Step 5 — DBSCAN clustering
-    segment_df = run_dbscan_clustering(segment_df, dbscan_eps, min_samples)
-
-    # Step 6 — Normalized score
+    # Step 5 — Normalized score
     segment_df = compute_normalized_risk_score(segment_df)
 
-    # Step 7 — Rank blackspots (sorted by rank score desc)
+    # Gate 3: Filter allowed percentage and minimum score
+    top_pct     = getattr(settings, "BLACKSPOT_TOP_PERCENT", 10) / 100
+    score_floor = getattr(settings, "BLACKSPOT_MIN_SCORE", 60)
+    max_allowed = max(1, int(len(segment_df) * top_pct))
+
+    candidates = segment_df[
+        segment_df["passes_criteria_gate"] &
+        (segment_df["normalized_risk_score"] >= score_floor)
+    ].sort_values("blackspot_rank_score", ascending=False)
+
+    confirmed_idx = candidates.head(max_allowed).index
+    segment_df["is_blackspot"] = False
+    segment_df.loc[confirmed_idx, "is_blackspot"] = True
+    segment_df["is_watch_zone"] = segment_df["is_watch_zone"] & ~segment_df["is_blackspot"]
+
+    # Step 6 — DBSCAN clustering
+    segment_df = run_dbscan_clustering(segment_df, dbscan_eps, min_samples)
+
+    # Step 7 — Confidence score (requires DBSCAN cluster_id, hence placed after)
+    segment_df = compute_confidence_score(segment_df, prior_blackspot_kms)
+
+    # Step 8 — Rank blackspots (sorted by rank score desc)
     blackspot_mask = segment_df["is_blackspot"]
     segment_df["rank"] = np.nan
     ranked_idx = (

@@ -1,9 +1,11 @@
 "use client";
 import { useEffect, useState, useCallback } from "react";
-import { Upload, FileText, CheckCircle, XCircle, RefreshCw, AlertTriangle, Loader2, Clock } from "lucide-react";
-import { uploadFile, fetchUploads, pollUploadStatus } from "@/services/api";
+import { Upload, FileText, CheckCircle, XCircle, RefreshCw, AlertTriangle, Loader2, Clock, Trash2, Pencil } from "lucide-react";
+import { uploadFile, fetchUploads, pollUploadStatus, deleteUpload, updateUploadLabel } from "@/services/api";
 import type { UploadRecord } from "@/types";
 import { StatusBadge } from "@/components/ui/Badge";
+import { useAlertContext } from "@/context/AlertContext";
+import { useQueryClient } from "@tanstack/react-query";
 
 type PipelinePhase =
   | "idle"
@@ -13,6 +15,9 @@ type PipelinePhase =
   | "failed";
 
 export default function UploadPage() {
+  const { refresh: refreshAlerts } = useAlertContext();
+  const qc = useQueryClient();
+
   const [uploads, setUploads] = useState<UploadRecord[]>([]);
   const [dragging, setDragging] = useState(false);
   const [phase, setPhase] = useState<PipelinePhase>("idle");
@@ -20,6 +25,15 @@ export default function UploadPage() {
   const [currentRecord, setCurrentRecord] = useState<UploadRecord | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadingUploads, setLoadingUploads] = useState(true);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [showDeleteModal, setShowDeleteModal] = useState<number | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  // Label editing state
+  const [labelEditId, setLabelEditId] = useState<number | null>(null);
+  const [labelDraft, setLabelDraft] = useState("");
+  const [yearDraft, setYearDraft] = useState("");
+  const [sourceDraft, setSourceDraft] = useState("");
+  const [savingLabel, setSavingLabel] = useState(false);
 
   const loadUploads = useCallback(async () => {
     setLoadingUploads(true);
@@ -88,6 +102,57 @@ export default function UploadPage() {
       setError(e?.response?.data?.detail ?? e?.message ?? "Upload failed. Check backend connection.");
     }
   }, [loadUploads]);
+
+  const confirmDelete = async () => {
+    if (showDeleteModal === null) return;
+    const id = showDeleteModal;
+    setDeletingId(id);
+    setShowDeleteModal(null);
+    try {
+      await deleteUpload(id);
+      await loadUploads();
+      await refreshAlerts();
+      // Invalidate React Query caches
+      qc.invalidateQueries();
+      setToastMessage("Data deleted successfully from all modules");
+      setTimeout(() => setToastMessage(null), 4000);
+      window.dispatchEvent(new Event("blackspot_data_deleted"));
+    } catch (e: any) {
+      alert("Failed to delete upload.");
+      console.error(e);
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const openLabelEdit = (u: UploadRecord) => {
+    setLabelEditId(u.id);
+    setLabelDraft(u.upload_label ?? "");
+    setYearDraft(u.upload_year ? String(u.upload_year) : "");
+    setSourceDraft(u.upload_source ?? "");
+  };
+
+  const saveLabel = async () => {
+    if (labelEditId === null) return;
+    setSavingLabel(true);
+    try {
+      await updateUploadLabel(labelEditId, {
+        upload_label:  labelDraft.trim() || undefined,
+        upload_year:   yearDraft ? Number(yearDraft) : undefined,
+        upload_source: sourceDraft.trim() || undefined,
+      });
+      await loadUploads();
+      qc.invalidateQueries({ queryKey: ["uploads"] });
+      qc.invalidateQueries({ queryKey: ["freshness"] });
+      setToastMessage("Label saved!");
+      setTimeout(() => setToastMessage(null), 3000);
+    } catch (e) {
+      alert("Failed to save label.");
+    } finally {
+      setSavingLabel(false);
+      setLabelEditId(null);
+    }
+  };
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -319,7 +384,7 @@ export default function UploadPage() {
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
               <thead>
                 <tr>
-                  {["ID", "Filename", "Type", "Status", "Records", "Segments", "Blackspots", "Uploaded", "Duration"].map((h) => (
+                  {["ID", "Label", "Filename", "Type", "Status", "Records", "Blackspots", "Uploaded", "Duration", "Actions"].map((h) => (
                     <th key={h} style={{ padding: "10px 14px", textAlign: "left", color: "var(--text-muted)", fontSize: "11px", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.5px", borderBottom: "1px solid var(--border)", whiteSpace: "nowrap" }}>
                       {h}
                     </th>
@@ -335,7 +400,22 @@ export default function UploadPage() {
                     onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                   >
                     <td style={{ padding: "13px 14px", color: "var(--text-muted)", fontWeight: 600 }}>#{u.id}</td>
-                    <td style={{ padding: "13px 14px", color: "var(--text-primary)", maxWidth: "220px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {/* Upload Label cell */}
+                    <td style={{ padding: "13px 14px", maxWidth: "180px" }}>
+                      {u.upload_label ? (
+                        <div>
+                          <div style={{ fontWeight: 600, fontSize: "12px", color: "var(--text-primary)" }}>{u.upload_label}</div>
+                          {(u.upload_year || u.upload_source) && (
+                            <div style={{ fontSize: "10px", color: "var(--text-muted)" }}>
+                              {[u.upload_year, u.upload_source].filter(Boolean).join(" · ")}
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <span style={{ color: "var(--text-muted)", fontSize: "11px" }}>—</span>
+                      )}
+                    </td>
+                    <td style={{ padding: "13px 14px", color: "var(--text-primary)", maxWidth: "180px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {u.original_filename}
                     </td>
                     <td style={{ padding: "13px 14px" }}>
@@ -355,6 +435,34 @@ export default function UploadPage() {
                     <td style={{ padding: "13px 14px", color: "var(--text-secondary)" }}>
                       {formatDuration(u.pipeline_started, u.pipeline_ended)}
                     </td>
+                    <td style={{ padding: "13px 14px" }}>
+                      <div style={{ display: "flex", gap: "6px" }}>
+                        <button
+                          onClick={() => openLabelEdit(u)}
+                          title="Edit label / metadata"
+                          style={{
+                            background: "rgba(99,102,241,0.1)", color: "#6366f1",
+                            border: "none", padding: "6px 8px", borderRadius: "8px",
+                            cursor: "pointer", display: "flex", alignItems: "center",
+                          }}
+                        >
+                          <Pencil size={14} />
+                        </button>
+                        <button
+                          onClick={() => setShowDeleteModal(u.id)}
+                          disabled={deletingId === u.id}
+                          style={{
+                            background: "rgba(239, 68, 68, 0.1)", color: "var(--accent-red)",
+                            border: "none", padding: "6px 10px", borderRadius: "8px",
+                            cursor: deletingId === u.id ? "not-allowed" : "pointer",
+                            display: "flex", alignItems: "center",
+                          }}
+                          title="Delete this upload completely"
+                        >
+                          {deletingId === u.id ? <Loader2 size={16} style={{ animation: "spin 1s linear infinite" }} /> : <Trash2 size={16} />}
+                        </button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -362,6 +470,78 @@ export default function UploadPage() {
           </div>
         )}
       </div>
+
+      {/* Label Edit Modal */}
+      {labelEditId !== null && (
+        <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", backdropFilter: "blur(2px)" }}>
+          <div className="glass-card" style={{ padding: "28px 32px", maxWidth: "400px", width: "100%", background: "var(--bg-primary)", display: "flex", flexDirection: "column", gap: "16px" }}>
+            <h3 style={{ fontSize: "16px", fontWeight: 700, color: "var(--text-primary)", margin: 0 }}>Tag Upload Metadata</h3>
+            <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: 0 }}>Add a human-readable label to identify this dataset in comparisons and reports.</p>
+            <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+              <input
+                placeholder="Label (e.g. NH-48 · 2022 Annual Data)"
+                value={labelDraft} onChange={e => setLabelDraft(e.target.value)}
+                style={{ padding: "9px 12px", borderRadius: "8px", border: "1px solid var(--border)", background: "var(--bg-primary)", color: "var(--text-primary)", fontSize: "13px" }}
+              />
+              <input
+                type="number" placeholder="Year (e.g. 2022)"
+                value={yearDraft} onChange={e => setYearDraft(e.target.value)}
+                style={{ padding: "9px 12px", borderRadius: "8px", border: "1px solid var(--border)", background: "var(--bg-primary)", color: "var(--text-primary)", fontSize: "13px" }}
+              />
+              <input
+                placeholder="Source (e.g. NHAI, State Police)"
+                value={sourceDraft} onChange={e => setSourceDraft(e.target.value)}
+                style={{ padding: "9px 12px", borderRadius: "8px", border: "1px solid var(--border)", background: "var(--bg-primary)", color: "var(--text-primary)", fontSize: "13px" }}
+              />
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px" }}>
+              <button onClick={() => setLabelEditId(null)} style={{ padding: "8px 14px", borderRadius: "8px", border: "1px solid var(--border)", background: "transparent", color: "var(--text-secondary)", cursor: "pointer", fontSize: "13px" }}>Cancel</button>
+              <button onClick={saveLabel} disabled={savingLabel} style={{ padding: "8px 18px", borderRadius: "8px", border: "none", background: "var(--gradient-1)", color: "white", fontSize: "13px", fontWeight: 600, cursor: "pointer" }}>
+                {savingLabel ? "Saving…" : "Save Label"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Confirmation Modal */}
+      {showDeleteModal !== null && (
+        <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", backdropFilter: "blur(2px)" }}>
+          <div className="glass-card" style={{ padding: "32px", maxWidth: "420px", display: "flex", flexDirection: "column", gap: "16px", background: "var(--bg-primary)" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+              <div style={{ width: 40, height: 40, borderRadius: "50%", background: "rgba(239,68,68,0.1)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <AlertTriangle size={20} color="var(--accent-red)" />
+              </div>
+              <h3 style={{ fontSize: "18px", fontWeight: 700, color: "var(--text-primary)" }}>Delete Upload Data?</h3>
+            </div>
+            <p style={{ color: "var(--text-muted)", fontSize: "14px", lineHeight: "1.5" }}>
+              This will completely erase all data associated with this upload, including raw records, processed segments, blackspots, and cached analytics. This action cannot be undone.
+            </p>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: "12px", marginTop: "12px" }}>
+              <button 
+                onClick={() => setShowDeleteModal(null)}
+                style={{ padding: "8px 16px", borderRadius: "8px", border: "1px solid var(--border)", background: "transparent", color: "var(--text-secondary)", cursor: "pointer", fontWeight: 600, fontSize: "13px" }}
+              >
+                Cancel
+              </button>
+              <button 
+                onClick={confirmDelete}
+                style={{ padding: "8px 16px", borderRadius: "8px", border: "none", background: "var(--accent-red)", color: "white", cursor: "pointer", fontWeight: 600, fontSize: "13px", display: "flex", alignItems: "center", gap: "6px" }}
+              >
+                {deletingId ? <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} /> : <Trash2 size={14} />} Yes, Delete Everything
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Success Toast */}
+      {toastMessage && (
+        <div style={{ position: "fixed", bottom: "32px", right: "32px", background: "var(--accent-green)", color: "white", padding: "12px 24px", borderRadius: "12px", display: "flex", alignItems: "center", gap: "12px", boxShadow: "0 10px 30px rgba(0,0,0,0.15)", zIndex: 9999, animation: "float-up 0.3s ease" }}>
+          <CheckCircle size={20} />
+          <span style={{ fontWeight: 600, fontSize: "14px" }}>{toastMessage}</span>
+        </div>
+      )}
     </div>
   );
 }

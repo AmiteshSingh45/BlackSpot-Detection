@@ -159,3 +159,7 @@ export function TimeRadarChart({ data, height = 300 }: ChartProps) {
     </ResponsiveContainer>
   );
 }
+
+// Alias so pages can import { CausesChart }
+export const CausesChart = HBarChart;
+

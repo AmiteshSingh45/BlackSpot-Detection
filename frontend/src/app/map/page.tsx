@@ -1,307 +1,190 @@
 "use client";
-import { useEffect, useState, useMemo, useCallback } from "react";
-import { MapPin, AlertTriangle, Filter, Info, RefreshCw } from "lucide-react";
-import { fetchBlackspots, fetchSegments } from "@/services/api";
+import { useState, useMemo, useEffect } from "react";
+import { MapPin, Layers, Filter } from "lucide-react";
+import dynamic from "next/dynamic";
+import { useBlackspots, useUploads } from "@/hooks/useBlackspotQueries";
 import type { BlackspotRecord } from "@/types";
 import { RiskBadge } from "@/components/ui/Badge";
+import ConfidenceBadge from "@/components/ui/ConfidenceBadge";
+import BlackspotDrawer from "@/components/ui/BlackspotDrawer";
 
-// Dynamic import for Leaflet (SSR-safe)
-import dynamic from "next/dynamic";
-const MapContainer = dynamic(() => import("react-leaflet").then((m) => m.MapContainer), { ssr: false });
-const TileLayer = dynamic(() => import("react-leaflet").then((m) => m.TileLayer), { ssr: false });
-const CircleMarker = dynamic(() => import("react-leaflet").then((m) => m.CircleMarker), { ssr: false });
-const Popup = dynamic(() => import("react-leaflet").then((m) => m.Popup), { ssr: false });
-const Tooltip = dynamic(() => import("react-leaflet").then((m) => m.Tooltip), { ssr: false });
+// Dynamic imports for Leaflet (SSR-safe)
+const MapContainer  = dynamic(() => import("react-leaflet").then(m => m.MapContainer),  { ssr: false });
+const TileLayer     = dynamic(() => import("react-leaflet").then(m => m.TileLayer),     { ssr: false });
+const CircleMarker  = dynamic(() => import("react-leaflet").then(m => m.CircleMarker),  { ssr: false });
+const Popup         = dynamic(() => import("react-leaflet").then(m => m.Popup),         { ssr: false });
+const Tooltip       = dynamic(() => import("react-leaflet").then(m => m.Tooltip),       { ssr: false });
 
 const RISK_COLORS: Record<string, string> = {
-  CRITICAL: "#ef4444",
-  HIGH: "#f97316",
-  MODERATE: "#f59e0b",
-  "BLACK SPOT": "#8b5cf6",
-  "WATCH ZONE": "#3b82f6",
-  SAFE: "#10b981",
+  CRITICAL: "#ef4444", HIGH: "#f97316", MODERATE: "#f59e0b",
+  "BLACK SPOT": "#8b5cf6", "WATCH ZONE": "#3b82f6", SAFE: "#10b981",
+};
+const TIER_PRIORITY: Record<string, number> = {
+  CRITICAL: 5, HIGH: 4, MODERATE: 3, "BLACK SPOT": 2, "WATCH ZONE": 1, SAFE: 0,
 };
 
 function getRiskColor(tier: string | null | undefined): string {
   if (!tier) return "#64748b";
   const t = tier.toUpperCase();
-  for (const [key, val] of Object.entries(RISK_COLORS)) {
-    if (t.includes(key)) return val;
-  }
+  for (const [k, v] of Object.entries(RISK_COLORS)) { if (t.includes(k)) return v; }
   return "#64748b";
 }
 
-// Map chainage km → approximate lat/lng along the NH corridor
-// Customize baseLat/baseLng to your actual highway coordinates
-function kmToLatLng(km: number): [number, number] {
-  const baseLat = 22.0;
-  const baseLng = 77.0;
-  const latPerKm = 0.009;
-  const lngJitter = Math.sin(km * 0.7) * 0.03;
-  return [baseLat + km * latPerKm, baseLng + lngJitter];
+function kmToLatLng(km: number, lat?: number | null, lng?: number | null): [number, number] {
+  if (lat != null && lng != null) return [lat, lng];
+  return [22.0 + km * 0.009, 77.0 + Math.sin(km * 0.15) * 0.04];
 }
 
+// Heatmap layer using leaflet.heat CDN (loaded in layout.tsx)
+function HeatLayer({ blackspots }: { blackspots: BlackspotRecord[] }) {
+  const { useMap } = require("react-leaflet");
+  const map = useMap();
+
+  useEffect(() => {
+    const L = (window as any).L;
+    if (!L?.heatLayer) return;
+    const points = blackspots.map((bs) => {
+      const [lat, lng] = kmToLatLng(bs.segment_500m, bs.latitude, bs.longitude);
+      const intensity  = Math.min(bs.total_accidents / 20, 1.0);
+      return [lat, lng, intensity];
+    });
+    const layer = L.heatLayer(points, { radius: 35, blur: 25, maxZoom: 14 }).addTo(map);
+    return () => { map.removeLayer(layer); };
+  }, [blackspots, map]);
+
+  return null;
+}
+
+const HeatLayerDynamic = dynamic(
+  () => Promise.resolve(HeatLayer),
+  { ssr: false }
+);
+
 export default function MapPage() {
-  const [blackspots, setBlackspots] = useState<BlackspotRecord[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<string>("all");
-  const [selected, setSelected] = useState<BlackspotRecord | null>(null);
-  const [isMounted, setIsMounted] = useState(false);
+  const [isMounted, setIsMounted]   = useState(false);
+  const [riskFilter, setRiskFilter] = useState("all");
+  const [uploadFilter, setUploadFilter] = useState<number | undefined>(undefined);
+  const [showHeatmap, setShowHeatmap]   = useState(false);
+  const [drawerBsId, setDrawerBsId]     = useState<number | null>(null);
 
-  const loadData = useCallback(async (isRefresh = false) => {
-    if (isRefresh) setRefreshing(true);
-    else setLoading(true);
-    setError(null);
-    try {
-      const [bs] = await Promise.all([
-        fetchBlackspots({ limit: 500 }),
-        fetchSegments({ limit: 1 }), // just ping segments to warm cache
-      ]);
-      setBlackspots(bs.blackspots ?? []);
-    } catch (e: any) {
-      setError("Failed to load map data. Check backend connection.");
-      console.error(e);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
+  useEffect(() => { setIsMounted(true); }, []);
+
+  const { data: uploadsData } = useUploads();
+  const uploads = uploadsData?.uploads ?? [];
+
+  const { data, isLoading, isError, refetch } = useBlackspots({
+    limit: 500, upload_id: uploadFilter,
+  });
+  const allBlackspots: BlackspotRecord[] = data?.blackspots ?? [];
+
+  // ── Top-100 rendering cap ────────────────────────────────────────
+  // Always include ALL CRITICAL, fill remaining slots by rank score
+  const renderList = useMemo(() => {
+    let list = allBlackspots;
+    if (riskFilter !== "all") {
+      list = list.filter(b => (b.risk_tier ?? "").toUpperCase().includes(riskFilter.toUpperCase()));
     }
-  }, []);
+    const critical = list.filter(b => (b.risk_tier ?? "").toUpperCase() === "CRITICAL");
+    const rest = list
+      .filter(b => (b.risk_tier ?? "").toUpperCase() !== "CRITICAL")
+      .sort((a, b) => (b.blackspot_rank_score ?? 0) - (a.blackspot_rank_score ?? 0))
+      .slice(0, Math.max(0, 100 - critical.length));
+    return [...critical, ...rest];
+  }, [allBlackspots, riskFilter]);
 
-  useEffect(() => {
-    setIsMounted(true);
-    loadData();
-  }, [loadData]);
+  const mapCenter: [number, number] = renderList.length > 0
+    ? kmToLatLng(renderList[0].segment_500m, renderList[0].latitude, renderList[0].longitude)
+    : [22.0, 77.0];
 
-  // Refresh on focus
-  useEffect(() => {
-    const onFocus = () => loadData(true);
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
-  }, [loadData]);
-
-  const filtered = useMemo(() => {
-    if (filter === "all") return blackspots;
-    return blackspots.filter((bs) =>
-      (bs.risk_tier ?? "").toUpperCase().includes(filter.toUpperCase())
-    );
-  }, [blackspots, filter]);
-
-  const stats = useMemo(() => ({
-    critical: blackspots.filter((b) => (b.risk_tier ?? "").toUpperCase().includes("CRITICAL")).length,
-    high:     blackspots.filter((b) => (b.risk_tier ?? "").toUpperCase() === "HIGH").length,
-    moderate: blackspots.filter((b) => (b.risk_tier ?? "").toUpperCase() === "MODERATE").length,
-    blackspot: blackspots.filter((b) => (b.risk_tier ?? "").toUpperCase().includes("BLACK SPOT")).length,
-  }), [blackspots]);
-
-  const center: [number, number] = useMemo(() => {
-    if (blackspots.length === 0) return [22.5, 77.0];
-    const avgKm = blackspots.reduce((s, b) => s + b.segment_500m, 0) / blackspots.length;
-    return kmToLatLng(avgKm);
-  }, [blackspots]);
+  const panelStyle: React.CSSProperties = {
+    position: "absolute", zIndex: 1000,
+    background: "var(--bg-secondary)",
+    border: "1px solid var(--border)",
+    borderRadius: "12px",
+    padding: "14px 16px",
+    boxShadow: "0 8px 32px rgba(0,0,0,0.35)",
+  };
 
   return (
-    <div style={{ display: "flex", gap: "20px", height: "calc(100vh - 130px)", animation: "float-up 0.4s ease" }}>
-      {/* ── Left panel ── */}
-      <div style={{ width: "280px", flexShrink: 0, display: "flex", flexDirection: "column", gap: "16px", overflowY: "auto" }}>
-        {/* Summary stats */}
-        <div className="glass-card" style={{ padding: "20px" }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px" }}>
-            <div style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: "8px" }}>
-              <MapPin size={16} color="var(--accent-blue)" />
-              Map Summary
-            </div>
-            <button
-              onClick={() => loadData(true)}
-              disabled={refreshing}
-              title="Refresh map data"
-              style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", padding: "4px" }}
-            >
-              <RefreshCw size={13} style={{ animation: refreshing ? "spin 1s linear infinite" : "none" }} />
-            </button>
-          </div>
-          <StatRow label="Total Plotted" value={filtered.length} color="var(--accent-blue)" />
-          <StatRow label="Critical" value={stats.critical} color="#ef4444" />
-          <StatRow label="High" value={stats.high} color="#f97316" />
-          <StatRow label="Moderate" value={stats.moderate} color="#f59e0b" />
-          <StatRow label="Black Spot" value={stats.blackspot} color="#8b5cf6" />
-        </div>
-
-        {/* Filter */}
-        <div className="glass-card" style={{ padding: "20px" }}>
-          <div style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-secondary)", marginBottom: "12px", display: "flex", alignItems: "center", gap: "6px" }}>
-            <Filter size={14} />
-            Filter by Risk
-          </div>
-          {[
-            { value: "all", label: "All Blackspots" },
-            { value: "critical", label: "Critical" },
-            { value: "high", label: "High" },
-            { value: "moderate", label: "Moderate" },
-            { value: "black spot", label: "Black Spot" },
-            { value: "watch zone", label: "Watch Zone" },
-          ].map((f) => (
-            <button
-              key={f.value}
-              onClick={() => setFilter(f.value)}
-              style={{
-                width: "100%", padding: "9px 12px", marginBottom: "6px",
-                borderRadius: "8px",
-                border: filter === f.value ? "1px solid var(--accent-blue)" : "1px solid var(--border)",
-                background: filter === f.value ? "rgba(79,142,247,0.15)" : "transparent",
-                color: filter === f.value ? "var(--accent-blue)" : "var(--text-secondary)",
-                fontSize: "13px", fontWeight: filter === f.value ? 600 : 400,
-                cursor: "pointer", textAlign: "left", transition: "all 0.15s",
-              }}
-            >
-              {f.label}
-              {f.value !== "all" && (
-                <span style={{ float: "right", fontSize: "11px", opacity: 0.7 }}>
-                  {blackspots.filter((b) => (b.risk_tier ?? "").toLowerCase().includes(f.value)).length}
-                </span>
-              )}
-            </button>
-          ))}
-        </div>
-
-        {/* Legend */}
-        <div className="glass-card" style={{ padding: "20px" }}>
-          <div style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-secondary)", marginBottom: "12px" }}>Legend</div>
-          {Object.entries(RISK_COLORS).map(([tier, color]) => (
-            <div key={tier} style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
-              <div style={{ width: 12, height: 12, borderRadius: "50%", background: color, flexShrink: 0 }} />
-              <span style={{ fontSize: "12px", color: "var(--text-secondary)", textTransform: "capitalize" }}>{tier.toLowerCase()}</span>
-            </div>
-          ))}
-          <div style={{ marginTop: "12px", paddingTop: "12px", borderTop: "1px solid var(--border)", fontSize: "11px", color: "var(--text-muted)" }}>
-            Marker size = accident count
-          </div>
-        </div>
-
-        {/* Selected info panel */}
-        {selected && (
-          <div className="glass-card" style={{ padding: "20px" }}>
-            <div style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-primary)", marginBottom: "12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                <Info size={14} color="var(--accent-blue)" />
-                Selected
-              </span>
-              <button onClick={() => setSelected(null)} style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", fontSize: "16px", lineHeight: 1 }}>×</button>
-            </div>
-            <div style={{ fontSize: "13px", fontWeight: 700, color: "var(--accent-blue)", marginBottom: "8px" }}>km {selected.segment_500m}</div>
-            <RiskBadge tier={selected.risk_tier} />
-            <div style={{ marginTop: "12px", display: "flex", flexDirection: "column", gap: "6px" }}>
-              <MiniStat label="Accidents" value={selected.total_accidents} />
-              <MiniStat label="Fatalities" value={selected.total_fatal} />
-              <MiniStat label="Grievous" value={selected.total_grievous} />
-              <MiniStat label="Rank Score" value={(selected.blackspot_rank_score ?? 0).toFixed(2)} />
-              <MiniStat label="Acc. Rate/yr" value={(selected.accident_rate ?? 0).toFixed(2)} />
-              {selected.dominant_cause && <MiniStat label="Cause" value={selected.dominant_cause} />}
-              {selected.cluster_id !== null && selected.cluster_id !== undefined && selected.cluster_id >= 0 && (
-                <MiniStat label="Cluster" value={`#${selected.cluster_id}`} />
-              )}
-            </div>
-          </div>
-        )}
+    <div style={{ display: "flex", flexDirection: "column", gap: "16px", animation: "float-up 0.4s ease" }}>
+      <div>
+        <h2 style={{ fontSize: "22px", fontWeight: 800, color: "var(--text-primary)" }}>
+          Interactive Map
+        </h2>
+        <p style={{ color: "var(--text-muted)", fontSize: "13px", marginTop: "4px" }}>
+          {isLoading ? "Loading…"
+            : `Rendering ${renderList.length} of ${allBlackspots.length} blackspots (top-100 cap active)`}
+        </p>
       </div>
 
-      {/* ── Map area ── */}
-      {/* IMPORTANT: position:relative so the loading overlay is positioned correctly */}
-      <div className="glass-card" style={{ flex: 1, overflow: "hidden", padding: 0, borderRadius: "16px", position: "relative" }}>
-        {/* Loading overlay */}
-        {(loading || !isMounted) && (
-          <div style={{
-            position: "absolute", inset: 0, zIndex: 1000,
-            display: "flex", alignItems: "center", justifyContent: "center",
-            background: "rgba(15,17,23,0.85)", borderRadius: "16px",
-            flexDirection: "column", gap: "12px",
-          }}>
-            <div style={{ width: 40, height: 40, borderRadius: "50%", border: "3px solid rgba(79,142,247,0.3)", borderTopColor: "#4f8ef7", animation: "spin 0.8s linear infinite" }} />
-            <div style={{ color: "var(--text-primary)", fontWeight: 600, fontSize: "14px" }}>Loading map data...</div>
-          </div>
-        )}
+      {isError && (
+        <div style={{ padding: "12px 16px", borderRadius: "10px", background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", display: "flex", gap: "10px", alignItems: "center" }}>
+          <span style={{ color: "#ef4444", fontSize: "13px" }}>Failed to load blackspot data.</span>
+          <button onClick={() => refetch()} style={{ marginLeft: "auto", padding: "4px 12px", borderRadius: "8px", border: "1px solid #ef4444", background: "transparent", color: "#ef4444", fontSize: "12px", cursor: "pointer" }}>Retry</button>
+        </div>
+      )}
 
-        {/* Error overlay */}
-        {error && !loading && (
-          <div style={{
-            position: "absolute", inset: 0, zIndex: 1000,
-            display: "flex", alignItems: "center", justifyContent: "center",
-            background: "rgba(15,17,23,0.85)", borderRadius: "16px",
-            flexDirection: "column", gap: "12px",
-          }}>
-            <AlertTriangle size={36} color="var(--accent-red)" />
-            <div style={{ color: "var(--text-primary)", fontWeight: 600 }}>{error}</div>
-            <button onClick={() => loadData()} style={{ padding: "8px 20px", borderRadius: "10px", border: "1px solid var(--accent-blue)", background: "transparent", color: "var(--accent-blue)", fontSize: "13px", cursor: "pointer" }}>
-              Retry
-            </button>
-          </div>
-        )}
-
-        {/* Empty state overlay */}
-        {!loading && !error && isMounted && blackspots.length === 0 && (
-          <div style={{
-            position: "absolute", inset: 0, zIndex: 1000,
-            display: "flex", alignItems: "center", justifyContent: "center",
-            background: "rgba(15,17,23,0.7)", borderRadius: "16px",
-            flexDirection: "column", gap: "12px",
-          }}>
-            <MapPin size={48} color="var(--text-muted)" style={{ opacity: 0.4 }} />
-            <div style={{ color: "var(--text-primary)", fontWeight: 600 }}>No blackspots detected yet</div>
-            <div style={{ color: "var(--text-muted)", fontSize: "13px" }}>Upload accident data to populate the map</div>
-          </div>
-        )}
-
-        {/* Leaflet map — only render when mounted and data available */}
+      {/* Map canvas */}
+      <div className="glass-card" style={{ height: "72vh", overflow: "hidden", padding: 0, position: "relative" }}>
         {isMounted && (
           <MapContainer
-            key={center.join(",")}
-            center={center}
-            zoom={blackspots.length > 0 ? 9 : 6}
-            style={{ width: "100%", height: "100%", borderRadius: "16px", background: "#1a1d27" }}
+            center={mapCenter}
+            zoom={10}
+            style={{ height: "100%", width: "100%", borderRadius: "14px" }}
           >
             <TileLayer
               url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-              attribution="&copy; OpenStreetMap &amp; CartoDB"
+              attribution='&copy; <a href="https://carto.com/">CARTO</a>'
             />
-            {filtered.map((bs) => {
-              const [lat, lng] = kmToLatLng(bs.segment_500m);
+
+            {/* Heatmap layer */}
+            {showHeatmap && <HeatLayerDynamic blackspots={renderList} />}
+
+            {/* CircleMarkers — summary popup + drawer CTA */}
+            {!showHeatmap && renderList.map((bs) => {
+              const [lat, lng] = kmToLatLng(bs.segment_500m, bs.latitude, bs.longitude);
               const color = getRiskColor(bs.risk_tier);
-              const radius = Math.max(6, Math.min(22, (bs.total_accidents ?? 0) * 0.6));
+              const isCritical = (bs.risk_tier ?? "").toUpperCase() === "CRITICAL";
               return (
                 <CircleMarker
                   key={bs.id}
                   center={[lat, lng]}
-                  radius={radius}
+                  radius={isCritical ? 12 : 8}
                   pathOptions={{
-                    color,
-                    fillColor: color,
-                    fillOpacity: selected?.id === bs.id ? 0.95 : 0.72,
-                    weight: selected?.id === bs.id ? 3 : 1.5,
+                    color, fillColor: color, fillOpacity: 0.85,
+                    weight: isCritical ? 2.5 : 1.5,
                   }}
-                  eventHandlers={{ click: () => setSelected((prev) => prev?.id === bs.id ? null : bs) }}
                 >
-                  <Tooltip permanent={false} sticky>
-                    <div style={{ fontSize: "12px", lineHeight: "1.6" }}>
-                      <strong>km {bs.segment_500m}</strong><br />
-                      {bs.risk_tier ?? "Unknown"}<br />
-                      {bs.total_accidents} accidents · {bs.total_fatal} fatal
-                    </div>
+                  <Tooltip direction="top" offset={[0, -6]} opacity={0.95}>
+                    <span style={{ fontWeight: 700, fontSize: "12px" }}>
+                      km {bs.segment_500m} · {bs.risk_tier}
+                    </span>
                   </Tooltip>
                   <Popup>
-                    <div style={{ minWidth: "200px" }}>
-                      <strong style={{ fontSize: "14px" }}>km {bs.segment_500m}</strong>
-                      <div style={{ marginTop: "8px", fontSize: "12px", lineHeight: "1.8" }}>
-                        <div><strong>Risk:</strong> {bs.risk_tier ?? "—"}</div>
-                        <div><strong>Accidents:</strong> {bs.total_accidents}</div>
-                        <div><strong>Fatal:</strong> {bs.total_fatal}</div>
-                        <div><strong>Grievous:</strong> {bs.total_grievous}</div>
-                        <div><strong>Rank Score:</strong> {(bs.blackspot_rank_score ?? 0).toFixed(2)}</div>
-                        {bs.dominant_cause && <div><strong>Cause:</strong> {bs.dominant_cause}</div>}
-                        {bs.cluster_id !== null && bs.cluster_id !== undefined && bs.cluster_id >= 0 && (
-                          <div><strong>Cluster:</strong> #{bs.cluster_id}</div>
-                        )}
+                    <div style={{ minWidth: "200px", padding: "4px 0" }}>
+                      <div style={{ fontWeight: 700, fontSize: "14px", marginBottom: "4px" }}>
+                        km {bs.segment_500m}
                       </div>
+                      <div style={{ display: "flex", gap: "6px", alignItems: "center", marginBottom: "8px" }}>
+                        <RiskBadge tier={bs.risk_tier} />
+                        <ConfidenceBadge score={bs.confidence_score} size="sm" showScore={false} />
+                      </div>
+                      <div style={{ fontSize: "12px", color: "#374151", lineHeight: 1.6 }}>
+                        <b>{bs.total_accidents}</b> accidents · <b>{bs.total_fatal}</b> fatal
+                        {bs.dominant_cause && <><br />Cause: {bs.dominant_cause}</>}
+                      </div>
+                      <button
+                        onClick={() => setDrawerBsId(bs.id)}
+                        style={{
+                          marginTop: "10px", width: "100%",
+                          padding: "7px 0", borderRadius: "8px",
+                          background: "linear-gradient(135deg, #4f8ef7 0%, #7c3aed 100%)",
+                          border: "none", color: "white",
+                          fontSize: "12px", fontWeight: 700, cursor: "pointer",
+                        }}
+                      >
+                        View Full Analysis →
+                      </button>
                     </div>
                   </Popup>
                 </CircleMarker>
@@ -309,25 +192,109 @@ export default function MapPage() {
             })}
           </MapContainer>
         )}
+
+        {/* ── Left control panel ────────────────────────────────── */}
+        <div style={{ ...panelStyle, top: "16px", left: "16px", minWidth: "220px" }}>
+          <p style={{ fontSize: "10px", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--text-muted)", marginBottom: "10px" }}>
+            Controls
+          </p>
+
+          {/* Dataset selector */}
+          <select
+            value={uploadFilter ?? ""}
+            onChange={e => setUploadFilter(e.target.value ? Number(e.target.value) : undefined)}
+            style={{
+              width: "100%", padding: "7px 10px", borderRadius: "8px",
+              border: "1px solid var(--border)", background: "var(--bg-primary)",
+              color: "var(--text-primary)", fontSize: "12px", marginBottom: "10px",
+            }}
+          >
+            <option value="">All Datasets</option>
+            {uploads.map(u => (
+              <option key={u.id} value={u.id}>
+                {u.upload_label || u.original_filename}
+              </option>
+            ))}
+          </select>
+
+          {/* Risk tier filter */}
+          <p style={{ fontSize: "10px", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--text-muted)", marginBottom: "8px" }}>
+            Risk Tier
+          </p>
+          <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
+            {[
+              { label: "All Tiers",   val: "all" },
+              { label: "CRITICAL",    val: "CRITICAL" },
+              { label: "HIGH",        val: "HIGH" },
+              { label: "MODERATE",    val: "MODERATE" },
+              { label: "BLACK SPOT",  val: "BLACK SPOT" },
+            ].map(({ label, val }) => (
+              <button
+                key={val}
+                onClick={() => setRiskFilter(val)}
+                style={{
+                  padding: "6px 10px", borderRadius: "7px",
+                  border: riskFilter === val ? `1px solid ${getRiskColor(val === "all" ? null : val)}` : "1px solid var(--border)",
+                  background: riskFilter === val ? `${getRiskColor(val === "all" ? null : val)}18` : "transparent",
+                  color: riskFilter === val ? getRiskColor(val === "all" ? null : val) : "var(--text-secondary)",
+                  fontSize: "11px", fontWeight: riskFilter === val ? 700 : 400,
+                  cursor: "pointer", textAlign: "left",
+                }}
+              >
+                {val !== "all" && <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: getRiskColor(val), marginRight: 7 }} />}
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {/* Heatmap toggle */}
+          <div style={{ borderTop: "1px solid var(--border)", marginTop: "12px", paddingTop: "12px" }}>
+            <button
+              onClick={() => setShowHeatmap(v => !v)}
+              style={{
+                width: "100%", padding: "8px 0", borderRadius: "8px",
+                border: showHeatmap ? "1px solid #f97316" : "1px solid var(--border)",
+                background: showHeatmap ? "rgba(249,115,22,0.12)" : "transparent",
+                color: showHeatmap ? "#f97316" : "var(--text-secondary)",
+                fontSize: "12px", fontWeight: 600, cursor: "pointer",
+                display: "flex", alignItems: "center", justifyContent: "center", gap: "7px",
+              }}
+            >
+              <Layers size={13} /> {showHeatmap ? "Hide Heatmap" : "Show Heatmap"}
+            </button>
+          </div>
+        </div>
+
+        {/* ── Legend ────────────────────────────────────────────── */}
+        <div style={{ ...panelStyle, top: "16px", right: "16px" }}>
+          <p style={{ fontSize: "10px", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--text-muted)", marginBottom: "8px" }}>
+            Legend
+          </p>
+          {Object.entries(RISK_COLORS).slice(0, 4).map(([tier, color]) => (
+            <div key={tier} style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "5px" }}>
+              <span style={{ width: 10, height: 10, borderRadius: "50%", background: color, display: "inline-block", flexShrink: 0 }} />
+              <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>{tier}</span>
+            </div>
+          ))}
+          <div style={{ borderTop: "1px solid var(--border)", marginTop: "8px", paddingTop: "8px", fontSize: "10px", color: "var(--text-muted)" }}>
+            Top-100 by rank score shown
+          </div>
+        </div>
+
+        {/* Loading overlay */}
+        {isLoading && (
+          <div style={{
+            position: "absolute", inset: 0, borderRadius: "14px",
+            background: "rgba(0,0,0,0.4)", display: "flex",
+            alignItems: "center", justifyContent: "center", zIndex: 999,
+          }}>
+            <div style={{ color: "white", fontWeight: 600, fontSize: "14px" }}>Loading map data…</div>
+          </div>
+        )}
       </div>
-    </div>
-  );
-}
 
-function StatRow({ label, value, color }: { label: string; value: number; color: string }) {
-  return (
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-      <span style={{ fontSize: "13px", color: "var(--text-secondary)" }}>{label}</span>
-      <span style={{ fontSize: "14px", fontWeight: 700, color }}>{value}</span>
-    </div>
-  );
-}
-
-function MiniStat({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-      <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>{label}</span>
-      <span style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-primary)" }}>{value}</span>
+      {/* Full detail drawer */}
+      <BlackspotDrawer blackspotId={drawerBsId} onClose={() => setDrawerBsId(null)} />
     </div>
   );
 }
