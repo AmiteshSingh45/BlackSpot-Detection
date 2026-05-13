@@ -11,7 +11,7 @@ import {
 } from "@/types";
 
 const api = axios.create({
-  baseURL: "http://localhost:8000",
+  baseURL: "https://black-spot-detection-o53k.vercel.app",
   timeout: 30000,
   headers: {
     "X-API-Key": process.env.NEXT_PUBLIC_API_KEY ?? "",
